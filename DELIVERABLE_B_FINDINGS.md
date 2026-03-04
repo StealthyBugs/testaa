@@ -461,6 +461,50 @@
 
 ---
 
+---
+
+### [FINDING #13] Terraform State API — `File.read(params['file.path'])` Without `require_gitlab_workhorse!` (Severity: HIGH)
+
+- **Class:** Local File Read (LFI) / Defense-in-Depth Violation
+- **Impact:** If the `WorkhorseFile` type validation is ever bypassed (Grape version bug, middleware ordering issue, or direct Rails request in a misconfigured deployment), an attacker could read arbitrary files from the server via `File.read(params['file.path'])`.
+- **Preconditions:** Authenticated user with `admin_terraform_state` permission. Must bypass the `WorkhorseFile` type check on `params[:file]` (currently the primary defense). In standard production deployments with Workhorse, exploitation requires Workhorse bypass or middleware misconfiguration.
+- **Source(s):** `params['file.path']` — a dotted-key form parameter that can be set as a regular form field in direct HTTP requests
+- **Sink(s):** `File.read(file_path)` — reads file at attacker-controlled path with no path validation
+- **Dataflow summary:**
+  1. Attacker sends POST to `/api/v4/projects/:id/terraform/state/:name` with form field `file.path=/etc/passwd`
+  2. `before` block calls `authenticate!` and `authorize!` but does NOT call `require_gitlab_workhorse!` (line 23-27: only calls it for `/authorize` paths)
+  3. Grape `requires :file, type: WorkhorseFile` checks if `params[:file]` is an `UploadedFile` instance — **this is the primary defense** (currently blocks exploitation)
+  4. If that check passes: `file_path = params['file.path']` (line 146)
+  5. `File.exist?(file_path)` — file existence oracle (line 147)
+  6. `File.read(file_path)` — arbitrary file read (line 148)
+- **Evidence:**
+  - File: `lib/api/terraform/state.rb`
+  - Function: `post` action
+  - Lines: 142-148
+  - Snippet:
+    ```ruby
+    post do
+      authorize! :admin_terraform_state, user_project
+      file_path = params['file.path']
+      unprocessable_entity!('Terraform state file not found on disk') unless File.exist?(file_path)
+      data = File.read(file_path)
+    ```
+  - The `before` block (lines 23-27) only calls `require_gitlab_workhorse!` for paths ending in `/authorize`:
+    ```ruby
+    before do
+      if request.path_info.end_with?('/authorize')
+        require_gitlab_workhorse!
+        next
+      end
+      authenticate!
+    ```
+  - **Contrast:** The Files API (`lib/api/files.rb`, line 334) and Commits API (`lib/api/commits.rb`, line 298) BOTH call `require_gitlab_workhorse!` before accessing `params['file.path']`.
+- **Why defenses fail:** The endpoint relies on the `WorkhorseFile` type check on `params[:file]` (a *different* parameter) as its sole defense against arbitrary `file.path` values. This is a defense-in-depth violation: every other endpoint that reads `params['file.path']` independently verifies the request came from Workhorse. The `file.path` parameter has **no path validation** (no `check_path_traversal!`, no allowed path check).
+- **Exploit sketch:** In a deployment where Workhorse is misconfigured, bypassed, or where a Grape version bug allows type coercion bypass, an attacker sends `POST /api/v4/projects/1/terraform/state/test` with form fields `file.path=/opt/gitlab/embedded/service/gitlab-rails/config/secrets.yml` and a crafted `file` parameter that satisfies the type check. The response contains the file contents, including `secret_key_base` which enables RCE via cookie deserialization.
+- **Suggested fix:** Add `require_gitlab_workhorse!` to the `post` action, consistent with the Files API and Commits API patterns. Additionally, validate `file_path` against allowed upload paths: `UploadedFile.allowed_path?(file_path, Terraform::StateUploader.workhorse_local_upload_path)`.
+
+---
+
 ## ADDITIONAL POTENTIAL FINDINGS (Require Further Investigation)
 
 ### [POTENTIAL #1] `Gitlab::Json` using `Oj.load` with `mode: :rails` Globally
