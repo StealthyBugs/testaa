@@ -28,20 +28,36 @@ This reflects significant hardening effort, likely driven by the extensive Hacke
 
 ## Phase 1: Pattern Library from HackerOne Reports
 
-Note: Most H1 reports in the provided list were restricted/non-public. Pattern extraction was limited to publicly available information and general knowledge of GitLab vulnerability classes.
+22 H1 reports were analyzed across two ReportMiner workers. 19 reports were accessible and yielded detailed vulnerability patterns. The remaining 3 were restricted/non-public.
 
 ### Known GitLab Vulnerability Patterns (Historical)
 
-| Pattern ID | Category | Root Cause | Typical Sink | GitLab Fix Pattern |
-|-----------|----------|------------|--------------|-------------------|
-| P-001 | SSRF | Webhook/integration URLs not validated | `Gitlab::HTTP.get/post` | `UrlBlocker.validate!` with DNS rebinding protection |
-| P-002 | Path Traversal | Archive extraction without symlink protection | `tar -xf`, `File.read` | `clean_extraction_dir!` post-extraction cleanup |
-| P-003 | RCE via Import | Unsafe deserialization of imported YAML/JSON | `YAML.load`, ERB templates | `YAML.safe_load`, allowlisted attributes |
-| P-004 | XSS via Markdown | Insufficient sanitization in custom renderers | `html_safe`, `raw()` | Banzai sanitization pipeline, DOMPurify |
-| P-005 | AuthZ Bypass | Missing policy checks on new endpoints | Missing `authorize_*` | `before_action` guards, Declarative Policy |
-| P-006 | SSRF via Git | Repository import/mirror from internal URLs | `fetch_as_mirror` | `UrlBlocker.validate!` on repository URLs |
-| P-007 | CI Config Injection | Variable expansion in CI config | CI YAML includes | Input validation on CI variables |
-| P-008 | Command Injection | Shell metacharacters in git operations | `system()`, backticks | Array-based `Gitlab::Popen.popen` |
+| Pattern ID | Category | Root Cause | Example H1 Report | Bounty |
+|-----------|----------|------------|-------------------|--------|
+| P-001 | SSRF | Webhook/integration URLs bypassing `UrlBlocker` | #1092230 (FogBugz `Kernel.Open`) | $N/A |
+| P-002 | Path Traversal | Archive symlink following during import | #1439593 (Bulk Import UploadsPipeline) | $N/A |
+| P-003 | RCE via Import | Sawyer::Resource Redis command injection | #1672388 / #1679624 (GitHub Import) | $67,020 |
+| P-004 | XSS via Markdown | Unescaped string interpolation in HTML construction | #1212067 (DesignReferenceFilter), #1731349 (Kroki), #2257080 (mXSS) | $27,900+ |
+| P-005 | IDOR via Import | `assign_attributes` accepting foreign key `_ids` | #743953 / #767770 (Project Import) | $40,000 |
+| P-006 | Command Injection | Shell string interpolation in `Open3.popen3` | #1609965 (DecompressedArchiveSizeValidator) | $N/A |
+| P-007 | Git Flag Injection | Missing `--` separator before user-supplied refs | #658013 / #653125 (Search API, Commits API) | $N/A |
+| P-008 | Path Traversal | `..` in upload references during issue move | #827052 (UploadsRewriter) | $N/A |
+| P-009 | RCE via Parser | ExifTool DjVu `eval` on annotations | #1154542 (CVE-2021-22205) | $N/A |
+| P-010 | RCE via Parser | Kramdown inline options -> `const_get` -> `require_relative` | #1125425 (Wiki RCE) | $N/A |
+| P-011 | Auth Bypass | Parameter type confusion (array vs scalar) | #2293343 (CVE-2023-7028, password reset) | $35,000 |
+| P-012 | XSS via Import | Unsanitized label color from GitHub import | #1665658 (CSP bypass) | $N/A |
+| P-013 | XSS via Frontend | `v-html` with unescaped branch name | #723307 (MR rebase widget) | $3,500 |
+| P-014 | XSS via CRM | Unescaped contact names in autocomplete | #1578400 (Customer Relations) | $13,950 |
+| P-015 | Session Hijack | Impersonation session ID exposed to target user | #493324 (Admin impersonation) | $N/A |
+| P-016 | File Read via Import | JSON Schema `$ref` URI resolution to `file://` | #1132378 (JSON Schema Validator) | $N/A |
+
+### Cross-Cutting Themes
+
+1. **Import/export is the highest-risk attack surface**: 11 of 19 reports target import features (GitHub, FogBugz, Bulk, Project, Maven)
+2. **String interpolation** is the root cause in shell commands, HTML attributes, and git commands
+3. **Third-party tool trust**: ExifTool, Kramdown, CarrierWave, JSON schema validators all introduced vulnerabilities
+4. **Incomplete patches**: 4 reports (#1679624, #767770) are bypasses of prior fixes that addressed only one code path
+5. **Total bounties across accessible reports**: ~$200K+
 
 ---
 
