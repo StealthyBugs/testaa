@@ -71,10 +71,15 @@ This reflects significant hardening effort, likely driven by the extensive Hacke
 - Key routes: `config/routes.rb` loads sub-files from `config/routes/`
 - All API endpoints use Grape middleware with authentication
 
-### Worker 4: GraphQL
+### Worker 4: GraphQL/AuthZ Specialist
 - **Result**: GraphQL mutations consistently use `authorize` declarations
 - All mutation classes in `app/graphql/mutations/` inherit from `BaseMutation` which enforces authorization
 - No unauthenticated mutations found
+- **Deep analysis of rubocop `Graphql/AuthorizeTypes` disables**: 60+ CI types disable this rule. All traced to proper authorization at resolver or field level:
+  - `InstanceVariableType`: Resolver checks `can_admin_all_resources?` (admin-only) (`app/graphql/resolvers/ci/variables_resolver.rb:15`)
+  - `ProjectVariableType`/`GroupVariableType`: Field-level `authorize: :admin_cicd_variables` on `ProjectType` (`app/graphql/types/project_type.rb:529`) and `GroupType` (`app/graphql/types/group_type.rb:300`)
+  - Other types: Delegated to parent resolver, parent type, or CiLint mutation (documented in rubocop comments)
+- **`UnsubscribesController`** (`app/controllers/users/unsubscribes_controller.rb`): `skip_before_action :authenticate_user!` with `admin_unsubscribe!` — by design for email unsubscribe links (base64-encoded email in URL). Impact limited to admin email preferences only.
 
 ### Worker 5: API/REST
 - **Result**: Grape API endpoints use `params do ... end` blocks with type coercion
@@ -172,7 +177,7 @@ This reflects significant hardening effort, likely driven by the extensive Hacke
 - `YAML.load` only in spec files (not production)
 - `Marshal.load(Marshal.dump())` only for deep-copy (internal data, no user input)
 
-### Worker 20: H1 Pattern Verification
+### Worker 20: H1 Pattern Verification (Batch 1)
 - **Result**: All 6 tested historical H1 vulnerability patterns verified as properly fixed
 - **Command Injection (H1 #1609965)**: `DecompressedGzipSizeValidator` now uses array-form `Open3.pipeline_r` -- fixed
 - **Git Flag Injection (H1 #658013/#653125)**: Git operations migrated to Gitaly (gRPC) -- architectural fix
@@ -180,6 +185,15 @@ This reflects significant hardening effort, likely driven by the extensive Hacke
 - **DesignReferenceFilter XSS (H1 #1212067)**: `write_opening_tag` uses `CGI.escapeHTML` for all attribute values (`lib/banzai/filter/concerns/html_writer.rb:32`) -- fixed
 - **Kramdown RCE (H1 #1125425)**: Kramdown 2.5.1 includes upstream CVE-2021-28834 fix -- fixed (no app-level `forbidden_inline_options` blocklist, relies on gem version)
 - **FogBugz SSRF (H1 #1092230)**: No `Kernel.open`/`URI.open` in production; download service has strict domain allowlist `*.fogbugz.com` -- fixed
+
+### Worker 24: H1 Pattern Verification (Batch 2)
+- **Result**: All 6 additional H1 vulnerability patterns verified as properly fixed
+- **CVE-2023-7028 (Password Reset Array Injection)**: `.to_s` coercion on `resource_params[:email]` (`app/controllers/passwords_controller.rb:59`) + `permit` enforcing scalar types (line 89) -- **fixed** (belt-and-suspenders)
+- **CVE-2023-0050 (Kroki Diagram XSS)**: Allowlist validation via `diagram_formats.include?` (`lib/banzai/filter/kroki_filter.rb:30`) + DOM-based `create_element` construction (line 34) replaces string concatenation -- **fixed**
+- **H1 #2257080 (mXSS in AbstractReferenceFilter)**: Refactored to `TextReplacer` concern (`lib/banzai/filter/concerns/text_replacer.rb:39-69`) operating on text not HTML, with `CGI.escapeHTML` before insertion (line 66) -- **fixed** (architectural improvement)
+- **H1 #733072 (Maven Path Traversal)**: `file_path: true` validator triggers `Gitlab::PathTraversal.check_allowed_absolute_path_and_path_traversal!` (`lib/api/helpers/packages/maven.rb:14-15`) with URL-decode-before-check + `NO_SLASH_URL_PART_REGEX` on filename -- **fixed**
+- **H1 #743953/#767770 (Project Import IDOR via `_ids`)**: `AttributeCleaner::PROHIBITED_REFERENCES` blocks `/_ids\Z/` and `/_id\Z/` patterns (`lib/gitlab/import_export/attribute_cleaner.rb:16-17`) with narrow `ALLOWED_REFERENCES` allowlist -- **fixed**
+- **H1 #1672388/#1679624 (Sawyer::Resource Redis Injection)**: Representation layer extracts only scalar fields via `from_api_response`; `ToHash` module recursively converts Sawyer objects to plain hashes (`lib/gitlab/github_import/representation/to_hash.rb:21-31`) -- **fixed**
 
 ### Worker 21: Frontend XSS Specialist
 - **Result**: Reviewed `v-html` usage in Vue components and `raw()`/`html_safe` in ERB templates
@@ -328,7 +342,7 @@ This reflects significant hardening effort, likely driven by the extensive Hacke
 
 **No proven high/critical vulnerabilities with complete, verifiable attack paths were identified.**
 
-Five "Needs Confirmation" candidates were identified that require dynamic testing:
+All 12 tested historical HackerOne vulnerability patterns have been verified as properly fixed in the current codebase. Five "Needs Confirmation" candidates were identified that require dynamic testing:
 
 | # | Candidate | Potential Severity | Blocker for Proof |
 |---|-----------|-------------------|-------------------|
@@ -369,12 +383,14 @@ Five "Needs Confirmation" candidates were identified that require dynamic testin
 | 23 | `v-html` on diff `rich_text` without DOMPurify | Performance optimization; relies solely on server-side sanitization; defense-in-depth gap but not exploitable without server-side bug |
 | 24 | Wiki sidebar `v-html` without DOMPurify | Server renders through full Banzai `:wiki` pipeline with sanitization; client-side defense-in-depth gap |
 | 25 | Broadcast message placeholder injection | `CGI.escape` for hrefs, Nokogiri text node auto-escaping for content -- properly mitigated |
+| 26 | CI Variables GraphQL authorization bypass | `InstanceVariableType` disables `Graphql/AuthorizeTypes` but resolver checks `can_admin_all_resources?`; `ProjectType`/`GroupType` fields have `authorize: :admin_cicd_variables` |
+| 27 | Unauthenticated `admin_unsubscribe!` | By-design email unsubscribe mechanism; only affects admin email preferences; URL embedded in emails with base64-encoded email address |
 
 ---
 
 ## H1 Historical Pattern Verification
 
-All 6 tested historical HackerOne vulnerability patterns have been verified as properly fixed:
+All 12 tested historical HackerOne vulnerability patterns have been verified as properly fixed:
 
 | H1 Report | Vulnerability | Fix Status | Evidence |
 |-----------|--------------|------------|----------|
@@ -384,6 +400,12 @@ All 6 tested historical HackerOne vulnerability patterns have been verified as p
 | #1212067 | DesignReferenceFilter XSS | **Fixed** | `write_opening_tag` escapes all attributes via `CGI.escapeHTML` (`lib/banzai/filter/concerns/html_writer.rb:32`) |
 | #1125425 | Kramdown inline options RCE | **Fixed** | Kramdown 2.5.1 includes CVE-2021-28834 fix; spec tests verify formatter rejection |
 | #1092230 | FogBugz SSRF via `Kernel.open` | **Fixed** | No `Kernel.open`/`URI.open` in production; download service uses strict `*.fogbugz.com` domain allowlist |
+| #2293343 (CVE-2023-7028) | Password reset array injection | **Fixed** | `.to_s` coercion + `permit` scalar enforcement (`app/controllers/passwords_controller.rb:59,89`) |
+| #1731349 (CVE-2023-0050) | Kroki diagram XSS | **Fixed** | Allowlist + DOM-based `create_element` construction (`lib/banzai/filter/kroki_filter.rb:30,34`) |
+| #2257080 | mXSS in AbstractReferenceFilter | **Fixed** | `TextReplacer` operates on text not HTML; `CGI.escapeHTML` before insertion (`lib/banzai/filter/concerns/text_replacer.rb:66`) |
+| #733072 | Maven package path traversal | **Fixed** | `file_path: true` validator + `PathTraversal` regex with URL-decode (`lib/api/helpers/packages/maven.rb:14-15`) |
+| #743953 / #767770 | Project import IDOR via `_ids` | **Fixed** | `AttributeCleaner::PROHIBITED_REFERENCES` blocks `/_ids\Z/` pattern (`lib/gitlab/import_export/attribute_cleaner.rb:16-17`) |
+| #1672388 / #1679624 | Sawyer::Resource Redis injection | **Fixed** | Representation layer extracts scalar fields only; `ToHash` converts Sawyer to plain hashes (`lib/gitlab/github_import/representation/to_hash.rb:21-31`) |
 
 ---
 
