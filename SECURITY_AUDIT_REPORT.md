@@ -356,13 +356,53 @@ This reflects significant hardening effort, likely driven by the extensive Hacke
 - **Why low risk**: The format restriction (only media files) significantly limits exploitability even if path traversal were possible -- an attacker could not read sensitive text files like `/etc/passwd` or application secrets.
 - **Recommended investigation**: Test with URL-encoded or double-encoded traversal sequences, though impact is limited by format restriction
 
+### Candidate 14: DNS Rebinding in Bitbucket/GitHub/Gitea Importers (Missing `resolved_address`)
+**Status: Needs Confirmation (NOT counted as proven)**
+
+- **Category**: SSRF via DNS Rebinding
+- **Locations**:
+  - Bitbucket: `lib/gitlab/bitbucket_import/importers/repository_importer.rb:22-23`
+  - Bitbucket Server: `lib/gitlab/bitbucket_server_import/importers/repository_importer.rb:17`
+  - GitHub: `lib/gitlab/github_import/importer/repository_importer.rb:53`
+- **Description**: All three specialized importers call `project.repository.import_repository(project.unsafe_import_url)` and `fetch_as_mirror(project.unsafe_import_url)` WITHOUT passing a `resolved_address:` parameter. In contrast, the standard import path in `Projects::ImportService` (lines 108-110) calls `get_resolved_address` (line 78) which uses `UrlBlocker.validate!` with DNS rebinding protection, then passes `resolved_address:` to Gitaly.
+- **Attack path**:
+  1. Attacker configures a Bitbucket/GitHub import with URL pointing to attacker-controlled domain
+  2. At validation time (save), the domain resolves to a public IP (passes `PublicUrlValidator`)
+  3. Between validation and Gitaly fetch, attacker changes DNS to resolve to internal IP (e.g., `169.254.169.254`)
+  4. Gitaly performs `git clone` to the internal IP without re-validation
+- **Why uncertain**:
+  1. Requires precise timing of DNS TTL expiry between validation and Gitaly fetch
+  2. `git://` protocol may not be useful for cloud metadata attacks (needs HTTP)
+  3. Bitbucket/GitHub imports use HTTPS URLs which Gitaly handles via `git clone --mirror` (not raw HTTP)
+  4. Need to verify whether Gitaly has its own DNS rebinding protection
+- **If exploitable**: SSRF to internal services via DNS rebinding from any authenticated user with project creation permission (Medium-High)
+- **Recommended fix**: Pass `resolved_address:` to `import_repository` and `fetch_as_mirror` in all specialized importers, matching the pattern in `Projects::ImportService`
+
+### Candidate 15: Multiple Sidekiq Workers Call `.constantize` Without Class Allowlist
+**Status: Needs Confirmation (NOT counted as proven, requires Redis compromise)**
+
+- **Category**: Unsafe Deserialization / Code Injection
+- **Key Locations**:
+  - `app/workers/gitlab/scheduling/schedule_within_worker.rb:32` — `args['worker_class']&.constantize` then `.perform_at()` with no class allowlist
+  - `app/workers/delete_stored_files_worker.rb:15` — `class_name.constantize` with no allowlist
+  - `app/workers/concerns/reactive_cacheable_worker.rb:25` — `class_name.constantize` with no allowlist
+  - `app/workers/bulk_imports/relation_export_worker.rb:43` — `portable_class.classify.constantize`
+- **Description**: Several Sidekiq workers accept class names as job arguments and call `.constantize` without validating against an allowlist. If an attacker gains write access to Redis (e.g., via SSRF to Redis, compromised credentials), they can inject job payloads that instantiate arbitrary Ruby classes. `ScheduleWithinWorker` is the most dangerous because it calls `.perform_at()` on the resolved class, effectively allowing arbitrary Sidekiq job scheduling.
+- **Contrast**: Well-protected workers like `UnassignIssuablesWorker` have explicit `ENTITY_TYPES` allowlists.
+- **Why uncertain**:
+  1. Requires Redis compromise as prerequisite (not directly user-reachable)
+  2. `.constantize` alone doesn't execute code — subsequent method calls determine impact
+  3. Sidekiq job arguments come from internal code in normal operation
+- **If exploitable**: RCE via arbitrary class instantiation + method dispatch (Critical, but requires Redis access)
+- **Recommended fix**: Add explicit class allowlists to all workers that call `.constantize` on job arguments
+
 ---
 
 ## Proven Vulnerabilities
 
 **No proven high/critical vulnerabilities with complete, verifiable attack paths were identified.**
 
-All 12 tested historical HackerOne vulnerability patterns have been verified as properly fixed in the current codebase. Six "Needs Confirmation" candidates were identified that require dynamic testing:
+All 12 tested historical HackerOne vulnerability patterns have been verified as properly fixed in the current codebase. Eight "Needs Confirmation" candidates were identified that require dynamic testing:
 
 | # | Candidate | Potential Severity | Blocker for Proof |
 |---|-----------|-------------------|-------------------|
@@ -372,6 +412,8 @@ All 12 tested historical HackerOne vulnerability patterns have been verified as 
 | 11 | Legacy session deserialization | Low (RCE, but uses Rails `SerializerWithFallback`) | Requires Redis compromise as prerequisite; uses Rails serializer not raw Marshal |
 | 12 | HelpController path traversal | Low (LFI limited to media formats) | Format restriction (png/gif/jpeg/mp4/mp3) limits impact even if traversal succeeds |
 | 13 | WebUploadStrategy export SSRF | Medium-High (SSRF via permissive URL validation) | Runtime `Gitlab::HTTP` blocking may mitigate; DNS rebinding + admin setting interaction needs testing |
+| 14 | DNS rebinding in Bitbucket/GitHub importers | Medium-High (SSRF via DNS rebinding) | Need to verify Gitaly-level DNS rebinding protection; timing requirements |
+| 15 | Sidekiq workers with unguarded `.constantize` | Critical (RCE, requires Redis compromise) | Requires Redis write access as prerequisite; not directly user-reachable |
 
 ---
 
@@ -496,6 +538,10 @@ While no proven vulnerabilities were found, the following improvements would fur
 
 15. **Use `Gitlab::Json.safe_parse` in NDJSON reader**: `lib/gitlab/import_export/json/ndjson_reader.rb:49` uses `Gitlab::Json.parse` without structural limits. Switch to `safe_parse` to enforce depth/size limits and prevent resource exhaustion via crafted import files.
 
+16. **Add `resolved_address` to specialized importers**: Bitbucket (`lib/gitlab/bitbucket_import/importers/repository_importer.rb:22-23`), Bitbucket Server (`lib/gitlab/bitbucket_server_import/importers/repository_importer.rb:17`), and GitHub (`lib/gitlab/github_import/importer/repository_importer.rb:53`) importers call `import_repository`/`fetch_as_mirror` without `resolved_address:`. Add DNS rebinding protection matching `Projects::ImportService#get_resolved_address` (lines 169-184).
+
+17. **Add class allowlists to `.constantize` workers**: `ScheduleWithinWorker`, `DeleteStoredFilesWorker`, `ReactiveCacheableWorker`, `RelationExportWorker`, and other workers that call `.constantize` on Sidekiq arguments should add explicit class allowlists, matching the `UnassignIssuablesWorker` pattern (`ENTITY_TYPES = %w[Group Project].freeze`).
+
 ---
 
-*Report generated by automated static analysis using 25 specialized workers. All findings are based on code review only. Runtime behavior may differ. "Needs Confirmation" items require dynamic testing.*
+*Report generated by automated static analysis using 33+ specialized workers across two audit phases. All findings are based on code review only. Runtime behavior may differ. "Needs Confirmation" items require dynamic testing.*
