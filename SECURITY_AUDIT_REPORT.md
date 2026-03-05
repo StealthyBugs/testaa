@@ -134,6 +134,9 @@ Note: Most H1 reports in the provided list were restricted/non-public. Pattern e
 - **Result**: URL blocking applied to all outbound requests
 - Custom webhook templates use safe JSON serialization (`value.to_json` with quote stripping)
 - Token exposed in headers only for configured webhook token field
+- **SystemHook** (`app/models/hooks/system_hook.rb:46-49`) overrides `validate_public_url?` to return `false`, skipping URL validation entirely -- admin-only, runtime `Gitlab::HTTP` blocking still applies
+- CI remote includes share the `allow_local_requests_from_web_hooks_and_services?` setting with webhooks -- enabling local requests for webhooks also enables SSRF via CI remote includes
+- Webhook `interpolated_url` (with resolved URL variables containing potential secrets) stored in `WebHookLog` without masking
 
 ### Worker 16: Storage Specialist
 - **Result**: Object storage uses signed URLs with expiration
