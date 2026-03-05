@@ -143,13 +143,17 @@ This reflects significant hardening effort, likely driven by the extensive Hacke
 - Local includes read from git via Gitaly
 - Pipeline config processed through type-checked YAML schema
 
-### Worker 14: Import/Export Specialist
-- **Result**: Import/export has extensive protections
+### Worker 14: Import/Export Specialist (Extended)
+- **Result**: Import/export has extensive protections with some defense-in-depth gaps
 - Tar extraction followed by `clean_extraction_dir!` (file: `lib/gitlab/import_export/command_line_util.rb:135-149`)
 - Hard link detection and removal
 - Symlink detection and removal via `FileInfo.linked?`
 - Decompressed archive size validation
 - **TOCTOU concern**: Symlinks exist briefly between extraction and cleanup (see candidates)
+- **WebUploadStrategy SSRF**: Export upload URL uses permissive `addressable_url: true` defaults (localhost allowed, no DNS rebinding protection) vs import's strict validation (see Candidate 13)
+- **Defense-in-depth gaps**: LFS restorer (`lib/gitlab/import_export/lfs_restorer.rb:33-38`), UploadsManager (`lib/gitlab/import_export/uploads_manager.rb:29-31`), and AvatarRestorer (`lib/gitlab/import_export/avatar_restorer.rb:19`) lack independent `FileInfo.linked?` checks before `File.open`, unlike the NDJSON reader which has its own symlink check
+- **NDJSON DoS**: `ndjson_reader.rb:49` uses `Gitlab::Json.parse` instead of `safe_parse`, allowing deeply nested/oversized JSON structures (limited to 50MB `MAX_JSON_DOCUMENT_SIZE` per line)
+- **Import `AttributeCleaner`**: Properly blocks `/_id\Z/`, `/_ids\Z/`, `/_html\Z/` patterns with narrow allowlist (`lib/gitlab/import_export/attribute_cleaner.rb:14-17`)
 
 ### Worker 15: Webhooks/Integrations Specialist
 - **Result**: URL blocking applied to all outbound requests
@@ -284,6 +288,22 @@ This reflects significant hardening effort, likely driven by the extensive Hacke
 - **Description**: Several `.constantize` calls on class names
 - **Why it's not exploitable**: All traced class names come from internal model metadata (e.g., `issuable.class.name`), not from user input. Sidekiq worker args are enqueued by internal code.
 
+### Candidate 13: WebUploadStrategy Export SSRF via Permissive URL Validation
+**Status: Needs Confirmation (NOT counted as proven)**
+
+- **Category**: SSRF
+- **Location**: `lib/import/after_export_strategies/web_upload_strategy.rb:11` with `app/validators/addressable_url_validator.rb:55-66`
+- **Description**: The `WebUploadStrategy` validates its upload URL with bare `addressable_url: true`, which uses permissive defaults: `allow_localhost: true`, `allow_local_network: true`, `dns_rebind_protection: false`, `schemes: %w[http https]`. A project maintainer can trigger an export via `POST /api/v4/projects/:id/export` with `upload[url]` pointing to internal services (e.g., `http://169.254.169.254/`, `http://127.0.0.1:8080/`). The export archive is sent to the attacker-controlled URL via PUT/POST.
+- **Contrast with import**: The import `RemoteFile` strategy (`app/services/import/gitlab_projects/file_acquisition_strategies/remote_file.rb:13-18`) uses strict validation: `schemes: %w[https], allow_localhost: allow_local_requests?, allow_local_network: allow_local_requests?, dns_rebind_protection: true`.
+- **Runtime mitigation**: `Gitlab::HTTP` at line 64 applies runtime URL blocking via `Gitlab::CurrentSettings.allow_local_requests_from_web_hooks_and_services?` (`lib/gitlab/http.rb:85`). When this setting is `false` (default), runtime blocking prevents SSRF to private IPs.
+- **Why uncertain**:
+  1. Runtime `Gitlab::HTTP` URL blocking may independently prevent SSRF when `allow_local_requests` is `false`
+  2. DNS rebinding attack could bypass runtime check since `dns_rebind_protection` is disabled at validation time
+  3. If admin enables `allow_local_requests_from_web_hooks_and_services?` (common for webhook-heavy deployments), **all SSRF protections are removed** for export uploads
+  4. Requires `create_project_export` permission (project maintainer role)
+- **If exploitable**: SSRF to internal services (cloud metadata, internal APIs) from any project maintainer; export archive body acts as side-channel (Medium-High)
+- **Recommended fix**: Change to `validates :url, addressable_url: { schemes: %w[https], allow_localhost: allow_local_requests?, allow_local_network: allow_local_requests?, dns_rebind_protection: true }` matching the import strategy
+
 ### Candidate 9: Jenkins Integration SSRF via `addressable_url` Validator
 **Status: Needs Confirmation (NOT counted as proven)**
 
@@ -342,7 +362,7 @@ This reflects significant hardening effort, likely driven by the extensive Hacke
 
 **No proven high/critical vulnerabilities with complete, verifiable attack paths were identified.**
 
-All 12 tested historical HackerOne vulnerability patterns have been verified as properly fixed in the current codebase. Five "Needs Confirmation" candidates were identified that require dynamic testing:
+All 12 tested historical HackerOne vulnerability patterns have been verified as properly fixed in the current codebase. Six "Needs Confirmation" candidates were identified that require dynamic testing:
 
 | # | Candidate | Potential Severity | Blocker for Proof |
 |---|-----------|-------------------|-------------------|
@@ -351,6 +371,7 @@ All 12 tested historical HackerOne vulnerability patterns have been verified as 
 | 10 | CI remote include cache poisoning | Medium-High (cross-project config injection) | Requires `ci_cache_remote_includes` feature flag; cache behavior needs runtime verification |
 | 11 | Legacy session deserialization | Low (RCE, but uses Rails `SerializerWithFallback`) | Requires Redis compromise as prerequisite; uses Rails serializer not raw Marshal |
 | 12 | HelpController path traversal | Low (LFI limited to media formats) | Format restriction (png/gif/jpeg/mp4/mp3) limits impact even if traversal succeeds |
+| 13 | WebUploadStrategy export SSRF | Medium-High (SSRF via permissive URL validation) | Runtime `Gitlab::HTTP` blocking may mitigate; DNS rebinding + admin setting interaction needs testing |
 
 ---
 
@@ -445,30 +466,36 @@ The following areas were systematically reviewed:
 
 While no proven vulnerabilities were found, the following improvements would further harden the codebase (ordered by priority):
 
-1. **Pre-extraction tar validation**: Validate tar archive contents (checking for symlinks, absolute paths) BEFORE extraction rather than cleaning up after, to eliminate the TOCTOU window in `lib/gitlab/import_export/command_line_util.rb:95-98`.
+1. **WebUploadStrategy URL validation**: Change `validates :url, addressable_url: true` in `lib/import/after_export_strategies/web_upload_strategy.rb:11` to match the import strategy's strict validation: `addressable_url: { schemes: %w[https], allow_localhost: allow_local_requests?, allow_local_network: allow_local_requests?, dns_rebind_protection: true }`. Currently allows localhost, local network, HTTP, and has no DNS rebinding protection — significantly weaker than the import equivalent.
 
-2. **Jenkins integration URL validator**: Change from `addressable_url: true` to `public_url: true` for consistency with other integrations, preventing SSRF to localhost/internal IPs at configuration time.
+2. **Pre-extraction tar validation**: Validate tar archive contents (checking for symlinks, absolute paths) BEFORE extraction rather than cleaning up after, to eliminate the TOCTOU window in `lib/gitlab/import_export/command_line_util.rb:95-98`.
 
-3. **HelpController defense-in-depth**: Add `File.realpath` + prefix check to `app/controllers/help_controller.rb:38-46` rather than relying solely on `clean_path_info` for path sanitization.
+3. **Jenkins integration URL validator**: Change from `addressable_url: true` to `public_url: true` for consistency with other integrations, preventing SSRF to localhost/internal IPs at configuration time.
 
-4. **CI remote include cache scoping**: When `ci_cache_remote_includes` feature flag is enabled, scope the cache key to the project namespace to prevent cross-project cache sharing.
+4. **HelpController defense-in-depth**: Add `File.realpath` + prefix check to `app/controllers/help_controller.rb:38-46` rather than relying solely on `clean_path_info` for path sanitization.
 
-5. **Add `exp` claim to multipart upload JWTs**: `lib/gitlab/middleware/multipart.rb` generates JWTs without expiration. Add a short TTL (e.g., 5 minutes) to limit replay window.
+5. **CI remote include cache scoping**: When `ci_cache_remote_includes` feature flag is enabled, scope the cache key to the project namespace to prevent cross-project cache sharing.
 
-6. **Kramdown defense-in-depth**: Add explicit `forbidden_inline_options` configuration at the application level rather than relying solely on the upstream Kramdown gem version for CVE-2021-28834 protection.
+6. **Add `exp` claim to multipart upload JWTs**: `lib/gitlab/middleware/multipart.rb` generates JWTs without expiration. Add a short TTL (e.g., 5 minutes) to limit replay window.
 
-7. **Explicit URL allowlists for SSRF-sensitive features**: Features like ActivityPub federation and CI remote includes could benefit from explicit domain allowlists rather than relying solely on IP-based blocking.
+7. **Kramdown defense-in-depth**: Add explicit `forbidden_inline_options` configuration at the application level rather than relying solely on the upstream Kramdown gem version for CVE-2021-28834 protection.
 
-8. **Reduce `html_safe` surface area**: The codebase has many `html_safe` calls. While each individually appears safe, the pattern is error-prone for future development. Consider using Rails' `safe_join` and tag helpers more consistently.
+8. **Explicit URL allowlists for SSRF-sensitive features**: Features like ActivityPub federation and CI remote includes could benefit from explicit domain allowlists rather than relying solely on IP-based blocking.
 
-9. **Convert tooling shell commands to array form**: `tooling/lib/tooling/predictive_tests/mapping_fetcher.rb:132` and `scripts/lint/validate_fast_spec_helper_usage.rb:55-57` use string interpolation in shell commands. While not production code, CI tooling with shell injection could be exploited via crafted file paths or branch names.
+9. **Reduce `html_safe` surface area**: The codebase has many `html_safe` calls. While each individually appears safe, the pattern is error-prone for future development. Consider using Rails' `safe_join` and tag helpers more consistently.
 
-10. **Dependency proxy SSRF feature flag**: Ensure `dependency_proxy_for_containers_ssrf_protection` feature flag is enabled by default, as disabling it removes Workhorse-level SSRF filtering for Docker Hub downloads.
+10. **Convert tooling shell commands to array form**: `tooling/lib/tooling/predictive_tests/mapping_fetcher.rb:132` and `scripts/lint/validate_fast_spec_helper_usage.rb:55-57` use string interpolation in shell commands. While not production code, CI tooling with shell injection could be exploited via crafted file paths or branch names.
 
-11. **Upgrade CarrierWave**: `Gemfile:198` pins `carrierwave ~> 1.3` which has known CVEs (CVE-2021-21305 content-type allowlist bypass, CVE-2023-49090 path traversal on case-insensitive filesystems). Current maintained versions are 2.x/3.x.
+11. **Dependency proxy SSRF feature flag**: Ensure `dependency_proxy_for_containers_ssrf_protection` feature flag is enabled by default, as disabling it removes Workhorse-level SSRF filtering for Docker Hub downloads.
 
-12. **Add client-side sanitization to performance-critical `v-html` usages**: `diff_row.vue:294,416` deliberately skips DOMPurify for performance. Consider applying a lightweight client-side check or adding `v-safe-html` with performance profiling to restore defense-in-depth.
+12. **Upgrade CarrierWave**: `Gemfile:198` pins `carrierwave ~> 1.3` which has known CVEs (CVE-2021-21305 content-type allowlist bypass, CVE-2023-49090 path traversal on case-insensitive filesystems). Current maintained versions are 2.x/3.x.
+
+13. **Add client-side sanitization to performance-critical `v-html` usages**: `diff_row.vue:294,416` deliberately skips DOMPurify for performance. Consider applying a lightweight client-side check or adding `v-safe-html` with performance profiling to restore defense-in-depth.
+
+14. **Add independent symlink checks in import restorers**: `LfsRestorer` (`lib/gitlab/import_export/lfs_restorer.rb:33`), `UploadsManager` (`lib/gitlab/import_export/uploads_manager.rb:29`), and `AvatarRestorer` (`lib/gitlab/import_export/avatar_restorer.rb:19`) should add `Gitlab::Utils::FileInfo.linked?` checks before `File.open`, matching the NDJSON reader's defense-in-depth pattern.
+
+15. **Use `Gitlab::Json.safe_parse` in NDJSON reader**: `lib/gitlab/import_export/json/ndjson_reader.rb:49` uses `Gitlab::Json.parse` without structural limits. Switch to `safe_parse` to enforce depth/size limits and prevent resource exhaustion via crafted import files.
 
 ---
 
-*Report generated by automated static analysis using 23 specialized workers. All findings are based on code review only. Runtime behavior may differ. "Needs Confirmation" items require dynamic testing.*
+*Report generated by automated static analysis using 25 specialized workers. All findings are based on code review only. Runtime behavior may differ. "Needs Confirmation" items require dynamic testing.*
