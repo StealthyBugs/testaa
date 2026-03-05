@@ -366,6 +366,9 @@ Five "Needs Confirmation" candidates were identified that require dynamic testin
 | 20 | `Oj.load` with `:rails` mode on env vars | `lib/gitlab/fp/settings/env_var_override_processor.rb:98` -- env vars not user-controlled |
 | 21 | `ci/namespace_mirror.rb` dynamic SQL | Values are properly quoted; RuboCop suppression documented |
 | 22 | Tooling shell injection | `tooling/lib/tooling/predictive_tests/mapping_fetcher.rb:132` -- not production code |
+| 23 | `v-html` on diff `rich_text` without DOMPurify | Performance optimization; relies solely on server-side sanitization; defense-in-depth gap but not exploitable without server-side bug |
+| 24 | Wiki sidebar `v-html` without DOMPurify | Server renders through full Banzai `:wiki` pipeline with sanitization; client-side defense-in-depth gap |
+| 25 | Broadcast message placeholder injection | `CGI.escape` for hrefs, Nokogiri text node auto-escaping for content -- properly mitigated |
 
 ---
 
@@ -439,6 +442,10 @@ While no proven vulnerabilities were found, the following improvements would fur
 9. **Convert tooling shell commands to array form**: `tooling/lib/tooling/predictive_tests/mapping_fetcher.rb:132` and `scripts/lint/validate_fast_spec_helper_usage.rb:55-57` use string interpolation in shell commands. While not production code, CI tooling with shell injection could be exploited via crafted file paths or branch names.
 
 10. **Dependency proxy SSRF feature flag**: Ensure `dependency_proxy_for_containers_ssrf_protection` feature flag is enabled by default, as disabling it removes Workhorse-level SSRF filtering for Docker Hub downloads.
+
+11. **Upgrade CarrierWave**: `Gemfile:198` pins `carrierwave ~> 1.3` which has known CVEs (CVE-2021-21305 content-type allowlist bypass, CVE-2023-49090 path traversal on case-insensitive filesystems). Current maintained versions are 2.x/3.x.
+
+12. **Add client-side sanitization to performance-critical `v-html` usages**: `diff_row.vue:294,416` deliberately skips DOMPurify for performance. Consider applying a lightweight client-side check or adding `v-safe-html` with performance profiling to restore defense-in-depth.
 
 ---
 
