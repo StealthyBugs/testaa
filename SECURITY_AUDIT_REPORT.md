@@ -280,29 +280,31 @@ Note: Most H1 reports in the provided list were restricted/non-public. Pattern e
 - **If exploitable**: Cross-project CI configuration injection (Medium-High)
 
 ### Candidate 11: Legacy Marshal Deserialization in ActiveSession
-**Status: Needs Confirmation (NOT counted as proven)**
+**Status: Downgraded to Low Risk (NOT counted as proven)**
 
 - **Category**: Unsafe Deserialization
 - **Location**: `app/models/active_session.rb:250`
-- **Description**: Legacy code path uses `Marshal.load` to deserialize session data from Redis. If an attacker can write arbitrary data to the Redis session store, this could lead to RCE via Ruby gadget chains.
-- **Why uncertain**:
-  1. Redis access requires compromising the Redis instance itself (network-level attack)
-  2. This appears to be a legacy compatibility path
-  3. Session data is normally written by the application, not by users directly
-- **If exploitable**: RCE via Ruby deserialization gadget chains (Critical, but requires Redis compromise)
+- **Description**: Legacy code path uses `ActiveSupport::Cache::SerializerWithFallback[:marshal_7_1].load` (not raw `Marshal.load`) to deserialize session data from Redis. This is a Rails 7.1 serializer with fallback support.
+- **Why low risk**:
+  1. Uses Rails `SerializerWithFallback`, not raw `Marshal.load`
+  2. Redis access requires compromising the Redis instance itself (network-level attack)
+  3. This is a legacy compatibility path for session migration
+  4. Session data is written by the application, not by users directly
+- **If exploitable**: RCE via Ruby deserialization gadget chains (Critical, but requires Redis compromise as prerequisite)
 
 ### Candidate 12: HelpController Path Traversal (Single-Layer Defense)
-**Status: Needs Confirmation (NOT counted as proven)**
+**Status: Downgraded to Low Risk (NOT counted as proven)**
 
 - **Category**: Path Traversal / LFI
-- **Location**: `app/controllers/help_controller.rb:38-46`
-- **Description**: The `show` action uses `clean_path_info` to sanitize the path parameter, then uses `File.join(Rails.root, 'doc', path)` followed by `send_file`. The defense relies solely on `clean_path_info` without an `expand_path` prefix check.
-- **Why uncertain**:
-  1. `clean_path_info` removes `..` sequences, which is the primary traversal vector
-  2. `File.join` with `Rails.root` constrains the base directory
-  3. The path flows through Rails routing which may impose additional constraints
-- **If exploitable**: Read arbitrary files on the server (High)
-- **Recommended investigation**: Test with URL-encoded or double-encoded traversal sequences against `clean_path_info`
+- **Location**: `app/controllers/help_controller.rb:26,38-46`
+- **Description**: The `show` action uses `Rack::Utils.clean_path_info(params[:path])` to sanitize the path parameter, then uses `path_to_doc` method (line 142-144) which joins with `Rails.root/doc/` prefix, followed by `send_file`.
+- **Additional mitigations discovered**:
+  1. `clean_path_info` strips `../` sequences (Rack-level sanitization)
+  2. `path_to_doc` constrains output to `Rails.root/doc/` directory
+  3. File serving is limited to specific formats: png, gif, jpeg, mp4, mp3 -- not arbitrary files
+  4. Rails routing may impose additional constraints on path segments
+- **Why low risk**: The format restriction (only media files) significantly limits exploitability even if path traversal were possible -- an attacker could not read sensitive text files like `/etc/passwd` or application secrets.
+- **Recommended investigation**: Test with URL-encoded or double-encoded traversal sequences, though impact is limited by format restriction
 
 ---
 
@@ -310,15 +312,15 @@ Note: Most H1 reports in the provided list were restricted/non-public. Pattern e
 
 **No proven high/critical vulnerabilities with complete, verifiable attack paths were identified.**
 
-Four "Needs Confirmation" candidates were identified that require dynamic testing:
+Five "Needs Confirmation" candidates were identified that require dynamic testing:
 
 | # | Candidate | Potential Severity | Blocker for Proof |
 |---|-----------|-------------------|-------------------|
 | 1 | TOCTOU in tar extraction | Critical (arbitrary file write) | Requires runtime tar behavior testing; elevated privileges needed |
 | 9 | Jenkins integration SSRF | Medium (SSRF to internal services) | Need to verify runtime URL blocking independence from validator |
 | 10 | CI remote include cache poisoning | Medium-High (cross-project config injection) | Requires `ci_cache_remote_includes` feature flag; cache behavior needs runtime verification |
-| 11 | Legacy Marshal deserialization | Critical (RCE) | Requires Redis compromise as prerequisite |
-| 12 | HelpController path traversal | High (LFI) | Need to verify `clean_path_info` against encoded traversal sequences |
+| 11 | Legacy session deserialization | Low (RCE, but uses Rails `SerializerWithFallback`) | Requires Redis compromise as prerequisite; uses Rails serializer not raw Marshal |
+| 12 | HelpController path traversal | Low (LFI limited to media formats) | Format restriction (png/gif/jpeg/mp4/mp3) limits impact even if traversal succeeds |
 
 ---
 
